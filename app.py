@@ -15,7 +15,10 @@ class GestureDisappear:
     """Detecta mao aberta/fechada na webcam e mostra o status na tela.
 
     Rostos sao detectados, destacados em outra cor (magenta) e removidos
-    da mascara de pele, para que rosto/pescoco nao sejam confundidos com a mao.
+    da mascara de pele. A distincao entre mao e corpo e feita pelo FORMATO
+    do contorno: mao aberta (vales entre os dedos) e aceita em qualquer
+    lugar do quadro; um blob liso (punho/pescoco/ombro) so e aceito fora
+    da regiao da cabeca/pescoco.
 
     Estados possiveis (mostrados no topo da tela):
     - "sem mao": nenhuma mao detectada -> "MAO NAO DETECTADA"
@@ -67,7 +70,7 @@ class GestureDisappear:
     HEAD_MARGIN_SIDE = 0.25     # margem lateral da cabeca (fracao da largura do rosto)
     HEAD_MARGIN_TOP = 0.35      # margem acima do rosto: cabelo/testa
     NECK_DEPTH = 0.9            # profundidade da zona abaixo do rosto: pescoco
-    ZONE_BYPASS_DEFECTS = 3     # vais entre dedos p/ aceitar mao aberta dentro da zona
+    ZONE_BYPASS_DEFECTS = 3     # vales entre dedos p/ aceitar mao aberta dentro da zona
 
     # ---- parametros de deteccao da mao (ajuste se necessario) ----
     MIN_HAND_AREA = 1800        # area minima do contorno para considerar que ha uma mao
@@ -76,9 +79,11 @@ class GestureDisappear:
     HISTORY_FRAMES = 8          # tamanho da janela deslizante de classificacoes recentes
     CONFIRM_VOTES = 5           # votos na janela para confirmar uma mudanca de estado
     NO_HAND_TIMEOUT = 0.4       # segundos sem mao para voltar ao estado "sem mao"
-    OPEN_MIN_DEFECTS = 2        # qtd. de vales profundos entre os dedos -> mao aberta
+    OPEN_MIN_DEFECTS = 2        # vales entre dedos necessarios para considerar mao aberta
     DEFECT_DEPTH_RATIO = 0.08   # profundidade minima do vale (fracao do tamanho da mao)
-    OPEN_MAX_SOLIDITY = 0.78    # solidez abaixo disso -> mao aberta (punho fica acima de 0.85)
+    DEFECT_MAX_CHORD = 0.22     # largura maxima do vale entre dedos (fracao do tamanho da
+                                # mao). Vales mais largos sao axila/cotovelo/braco, nao
+                                # espacos entre dedos
 
     def __init__(self, webcam_index: int = 0, width: int = 1280, height: int = 720):
         self.cap = cv2.VideoCapture(webcam_index)
@@ -103,6 +108,7 @@ class GestureDisappear:
         self._history = deque(maxlen=self.HISTORY_FRAMES)
         self._candidate = None
         self._candidate_votes = 0
+        self._last_rejection = None
         self._tracked_faces = []
 
     # ------------------------------------------------------- deteccao de rosto
@@ -188,11 +194,15 @@ class GestureDisappear:
 
     def _remove_faces_from_mask(self, mask, faces, roi_x, roi_y):
         """Apaga da mascara de pele as regioes de rosto (com margem para
-        queixo e pescoco), para o rosto nao virar 'mao'."""
+        queixo e pescoco), para o rosto nao virar 'mao'.
+
+        As margens laterais sao pequenas de proposito: cortar demais
+        apagaria uma mao posicionada logo ao lado do rosto.
+        """
         for (fx, fy, fw, fh) in faces:
-            pad_side = int(fw * self.FACE_BOX_EXPAND) // 2
-            pad_top = int(fh * self.FACE_BOX_EXPAND) // 2
-            pad_bottom = int(fh * self.FACE_BOX_EXPAND)
+            pad_side = int(fw * self.FACE_MASK_PAD_SIDE)
+            pad_top = int(fh * self.FACE_MASK_PAD_TOP)
+            pad_bottom = int(fh * self.FACE_MASK_PAD_BOTTOM)
             x1 = max(0, fx - pad_side - roi_x)
             y1 = max(0, fy - pad_top - roi_y)
             x2 = min(mask.shape[1], fx + fw + pad_side - roi_x)
@@ -206,34 +216,44 @@ class GestureDisappear:
     def _select_hand(self, contours, faces, roi_x, roi_y):
         """Escolhe o contorno da mao entre os contornos de pele.
 
-        Regras, em ordem:
-        - testa do maior contorno para o menor;
-        - o contorno precisa parecer uma mao (area e proporcao);
-        - nao pode estar colado na regiao do rosto/cabeca: pescoco, ombros,
-          peito e cabelo ficam nessa zona proibida e nao sao maos.
+        A distincao entre mao e corpo e feita principalmente pelo FORMATO
+        do contorno, nao pela posicao:
+
+        - um contorno com vales profundos entre os dedos (mao aberta) e
+          aceito em qualquer lugar do quadro, ate colado no rosto;
+        - um contorno LISO (sem vales), como punho, pescoco, ombro ou
+          cabelo, so e aceito FORA da regiao da cabeca/pescoco.
+
+        Devolve (contorno, metricas, motivo). O motivo e None quando a
+        mao foi encontrada; quando nao ha mao, explica por que o maior
+        blob de pele foi descartado.
         """
         zones = []
         for (fx, fy, fw, fh) in faces:
+            side = int(fw * self.HEAD_MARGIN_SIDE)
             zones.append((
-                fx - int(fw * self.HEAD_ZONE_SIDE) - roi_x,
-                fy - int(fh * self.HEAD_ZONE_TOP) - roi_y,
-                fx + fw + int(fw * self.HEAD_ZONE_SIDE) - roi_x,
-                fy + fh + int(fh * self.HEAD_ZONE_BOTTOM) - roi_y,
+                fx - side - roi_x,
+                fy - int(fh * self.HEAD_MARGIN_TOP) - roi_y,
+                fx + fw + side - roi_x,
+                fy + fh + int(fh * self.NECK_DEPTH) - roi_y,
             ))
 
+        rejection = None
         for contour in sorted(contours, key=cv2.contourArea, reverse=True):
             metrics = self._hand_metrics(contour)
             if metrics is None:
-                continue
+                continue  # pequeno ou alongado demais (ruido, braco)
             bx, by, bw, bh = metrics["bbox"]
-            colada_na_cabeca = any(
+            na_zona = any(
                 bx < zx2 and bx + bw > zx1 and by < zy2 and by + bh > zy1
                 for (zx1, zy1, zx2, zy2) in zones
             )
-            if colada_na_cabeca:
+            if na_zona and metrics["deep_defects"] < self.ZONE_BYPASS_DEFECTS:
+                # blob liso dentro da zona cabeca/pescoco: e corpo, nao mao
+                rejection = "blob liso na zona do rosto/pescoco"
                 continue
-            return contour, metrics
-        return None, None
+            return contour, metrics, None
+        return None, None, rejection
 
     @staticmethod
     def _skin_mask(frame):
@@ -258,10 +278,12 @@ class GestureDisappear:
         """Classifica o contorno como mao aberta ou fechada.
 
         Retorna um dict com as metricas ou None se o contorno nao parecer uma mao.
-        - solidez: area do contorno / area do casco convexo. Punho fechado fica
-          proximo de 1.0; mao aberta com dedos afastados fica bem abaixo.
-        - vales profundos (convexity defects): espacos entre os dedos. Mao aberta
-          tem varios; punho fechado praticamente nenhum.
+        - solidez: area do contorno / area do casco convexo (informativa; um
+          braco dobrado tambem tem solidez baixa, entao ela NAO decide sozinha).
+        - vais entre dedos (convexity defects): espacos entre os dedos. Mao
+          aberta tem varios; punho fechado praticamente nenhum. Um vale so
+          conta como "vale de dedo" se for profundo E estreito (corda curta):
+          bracos/troncos tem cavidades profundas, mas largas (axila, cotovelo).
         """
         area = cv2.contourArea(contour)
         if area < self.MIN_HAND_AREA:
@@ -285,13 +307,20 @@ class GestureDisappear:
                 if defects is not None:
                     ref = float(max(w, h))
                     for i in range(defects.shape[0]):
-                        depth = defects[i, 0][3] / 256.0
-                        if depth > ref * self.DEFECT_DEPTH_RATIO:
-                            deep_defects += 1
+                        s, e, f, d = defects[i, 0]
+                        depth = d / 256.0
+                        if depth <= ref * self.DEFECT_DEPTH_RATIO:
+                            continue  # raso demais
+                        start = contour[s][0]
+                        end = contour[e][0]
+                        chord = float(np.hypot(end[0] - start[0], end[1] - start[1]))
+                        if chord > ref * self.DEFECT_MAX_CHORD:
+                            continue  # largo demais: axila/cotovelo/braco
+                        deep_defects += 1
         except cv2.error:
             pass
 
-        is_open = deep_defects >= self.OPEN_MIN_DEFECTS or solidity < self.OPEN_MAX_SOLIDITY
+        is_open = deep_defects >= self.OPEN_MIN_DEFECTS
         return {
             "area": area,
             "bbox": (x, y, w, h),
@@ -373,6 +402,17 @@ class GestureDisappear:
                 1,
                 cv2.LINE_AA,
             )
+        elif self._last_rejection:
+            cv2.putText(
+                frame,
+                f"ignorado: {self._last_rejection}",
+                (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (200, 200, 200),
+                1,
+                cv2.LINE_AA,
+            )
 
         if self._candidate is not None:
             cv2.putText(
@@ -415,7 +455,8 @@ class GestureDisappear:
         if faces:
             mask = self._remove_faces_from_mask(mask, faces, roi_x, roi_y)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contour, metrics = self._select_hand(contours, faces, roi_x, roi_y)
+        contour, metrics, rejection = self._select_hand(contours, faces, roi_x, roi_y)
+        self._last_rejection = rejection
 
         self._update_state(metrics, now)
 
