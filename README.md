@@ -1,18 +1,19 @@
 # Camera Gesture Disappear
 
-Projeto simples para testar um efeito de "sumir da câmera" usando processamento de imagem em tempo real com OpenCV.
+Projeto experimental para detectar um movimento brusco da mão e mostrar um feedback visual curto na tela.
 
 ## Objetivo
 
-Esse código foi criado como uma base experimental para detectar um gesto simples com a mão e trocar a imagem da câmera por uma tela invisível.
+A aplicação usa a webcam e processamento de diferença entre frames para identificar um movimento forte, parecido com um estalo na frente da câmera. Quando o gesto é reconhecido, a tela mostra um texto curto, como "OK", em vez de se tornar preta.
 
 ## Como funciona
 
-- captura a webcam com OpenCV
-- detecta regiões de pele na imagem
-- verifica se houve movimento/gesto relevante
-- quando o gesto dispara, ativa o efeito de invisibilidade
-- a aplicação funciona em preview local; para usar em Google Meet/Teams, o passo seguinte é conectar esse fluxo a uma câmera virtual externa
+- captura a câmera com OpenCV
+- converte cada frame para cinza
+- compara o frame atual com o anterior
+- calcula a quantidade de movimento
+- quando há um pico rápido, dispara o feedback visual
+- a janela da webcam fica aberta até pressionar `q`
 
 ## Requisitos
 
@@ -26,6 +27,7 @@ Esse código foi criado como uma base experimental para detectar um gesto simple
 cd camera-gesture-disappear
 python3 -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -37,23 +39,18 @@ python app.py
 
 ## Como usar
 
-- a janela do OpenCV deve abrir com a câmera
-- movimente a mão em frente à câmera para disparar o gesto
+- a janela da webcam deve abrir
+- mova a mão rapidamente na frente da câmera
+- o gesto deve disparar um texto "OK" por um instante
 - pressione `q` para sair
 
 ## Observações importantes
 
-Este projeto é uma base simples e funcional para testes locais. Ele não invade o Google Meet ou Teams diretamente.
+Para evitar o problema de incompatibilidade do MediaPipe no macOS, esta versão usa apenas OpenCV puro. Isso torna o projeto mais estável e mais fácil de rodar em computadores com câmera integrada.
 
-Para usar no Meet/Teams, normalmente o caminho correto é:
-
-1. rodar a aplicação localmente
-2. enviar a saída para uma câmera virtual (por exemplo, OBS Virtual Camera)
-3. selecionar essa câmera virtual dentro do app de reunião
-
-Em macOS, o fator mais comum de erro é a permissão da câmera do sistema para o VS Code ou Terminal.
+Se a câmera não abrir, confira a permissão da webcam no macOS e no próprio terminal/VS Code.
 
 ## Arquivos
 
 - `app.py` — lógica principal
-- `requirements.txt` — dependências
+- `requirements.txt` — dependências do projeto
