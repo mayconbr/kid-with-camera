@@ -1,15 +1,24 @@
+import os
 import time
+from collections import deque
 
 import cv2
 import numpy as np
 
 
+def _load_cascade(filename):
+    """Carrega um classificador Haar que acompanha o opencv-python."""
+    return cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, filename))
+
+
 class GestureDisappear:
-    """Detecta mao aberta/fechada na webcam, mostra o status na tela e
-    dispara um "OK" quando a mao abre e depois fecha.
+    """Detecta mao aberta/fechada na webcam e mostra o status na tela.
+
+    Rostos sao detectados, destacados em outra cor (magenta) e removidos
+    da mascara de pele, para que rosto/pescoco nao sejam confundidos com a mao.
 
     Estados possiveis (mostrados no topo da tela):
-    - "sem mao": nenhuma mao detectada na regiao de interesse (ROI)
+    - "sem mao": nenhuma mao detectada -> "MAO NAO DETECTADA"
     - "aberta": mao detectada com dedos abertos/afastados
     - "fechada": mao detectada fechada (punho)
     """
@@ -19,7 +28,7 @@ class GestureDisappear:
     STATE_CLOSED = "fechada"
 
     STATE_LABELS = {
-        STATE_NO_HAND: "SEM MAO",
+        STATE_NO_HAND: "MAO NAO DETECTADA",
         STATE_OPEN: "MAO ABERTA",
         STATE_CLOSED: "MAO FECHADA",
     }
@@ -29,22 +38,47 @@ class GestureDisappear:
         STATE_CLOSED: (80, 172, 255),
     }
 
+    FACE_COLOR = (255, 0, 255)  # magenta (BGR) para as caixas de rosto
+
     # legenda do que cada cor desenhada no video significa (valores em BGR)
     LEGEND = [
         ((0, 0, 255), "ROI: regiao de deteccao da mao"),
+        (FACE_COLOR, "Rosto detectado (ignorado)"),
         ((0, 255, 255), "Contorno da mao (pele detectada)"),
         ((255, 0, 0), "Caixa delimitadora da mao"),
         ((0, 255, 0), "Eixos do centro da caixa"),
     ]
 
-    # ---- parametros de deteccao (ajuste se necessario) ----
+    # ---- deteccao de rosto ----
+    FACE_DETECT_WIDTH = 480    # largura da imagem reduzida usada na deteccao (mais rapida)
+    FACE_SCALE_FACTOR = 1.1   # escala entre as passadas do cascade
+    FACE_MIN_NEIGHBORS = 5     # vizinhos necessarios (mais alto = menos falsos positivos)
+    FACE_MEMORY = 0.6          # segundos que um rosto fica lembrado sem ser redetectado
+
+    # margens para APAGAR o rosto da mascara de pele (desconecta o rosto do
+    # pescoco). Laterais pequenas para nao cortar uma mao ao lado do rosto.
+    FACE_MASK_PAD_SIDE = 0.10   # fracao da largura do rosto
+    FACE_MASK_PAD_TOP = 0.15    # fracao da altura do rosto
+    FACE_MASK_PAD_BOTTOM = 0.40  # fracao da altura do rosto (queixo + inicio do pescoco)
+
+    # zona de cabeca/pescoco: um blob LISO nessa regiao e tratado como corpo
+    # (pescoco/ombros) e nao como mao fechada. Uma mao ABERTA, com vales
+    # profundos entre os dedos, e aceita em qualquer lugar do quadro.
+    HEAD_MARGIN_SIDE = 0.25     # margem lateral da cabeca (fracao da largura do rosto)
+    HEAD_MARGIN_TOP = 0.35      # margem acima do rosto: cabelo/testa
+    NECK_DEPTH = 0.9            # profundidade da zona abaixo do rosto: pescoco
+    ZONE_BYPASS_DEFECTS = 3     # vais entre dedos p/ aceitar mao aberta dentro da zona
+
+    # ---- parametros de deteccao da mao (ajuste se necessario) ----
     MIN_HAND_AREA = 1800        # area minima do contorno para considerar que ha uma mao
-    MIN_CONFIRM_FRAMES = 4     # frames consecutivos para confirmar uma mudanca de estado
+    HAND_MIN_ASPECT = 0.25      # proporcao largura/altura minima de uma mao
+    HAND_MAX_ASPECT = 4.0       # proporcao largura/altura maxima (mais alongado = braco/pescoco)
+    HISTORY_FRAMES = 8          # tamanho da janela deslizante de classificacoes recentes
+    CONFIRM_VOTES = 5           # votos na janela para confirmar uma mudanca de estado
     NO_HAND_TIMEOUT = 0.4       # segundos sem mao para voltar ao estado "sem mao"
-    FEEDBACK_DURATION = 0.8     # segundos que o "OK" fica na tela
-    OPEN_MIN_DEFECTS = 2       # qtd. de vales profundos entre os dedos -> mao aberta
-    DEFECT_DEPTH_RATIO = 0.08  # profundidade minima do vale (fracao do tamanho da mao)
-    OPEN_MAX_SOLIDITY = 0.78   # solidez abaixo disso -> mao aberta (punho fica acima de 0.85)
+    OPEN_MIN_DEFECTS = 2        # qtd. de vales profundos entre os dedos -> mao aberta
+    DEFECT_DEPTH_RATIO = 0.08   # profundidade minima do vale (fracao do tamanho da mao)
+    OPEN_MAX_SOLIDITY = 0.78    # solidez abaixo disso -> mao aberta (punho fica acima de 0.85)
 
     def __init__(self, webcam_index: int = 0, width: int = 1280, height: int = 720):
         self.cap = cv2.VideoCapture(webcam_index)
@@ -58,13 +92,148 @@ class GestureDisappear:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
         self.window_name = "Gesture Disappear"
+        self.face_cascade = _load_cascade("haarcascade_frontalface_alt2.xml")
+        self.profile_cascade = _load_cascade("haarcascade_profileface.xml")
+        self._reset_tracking()
+
+    def _reset_tracking(self):
+        """(Re)inicia o estado do rastreamento de mao e rosto."""
         self.gesture_state = self.STATE_NO_HAND
         self.last_hand_time = 0.0
-        self.last_trigger_time = -10.0
+        self._history = deque(maxlen=self.HISTORY_FRAMES)
         self._candidate = None
-        self._candidate_count = 0
+        self._candidate_votes = 0
+        self._tracked_faces = []
 
-    # ------------------------------------------------------------- deteccao
+    # ------------------------------------------------------- deteccao de rosto
+
+    def _detect_faces(self, frame):
+        """Procura rostos no frame e devolve caixas (x, y, w, h).
+
+        Usa Haar cascades numa versao reduzida do frame (mais rapido).
+        Detecta rosto de frente e de perfil (nos dois lados).
+        """
+        if self.face_cascade.empty() and self.profile_cascade.empty():
+            return []
+
+        scale = self.FACE_DETECT_WIDTH / frame.shape[1]
+        small_w = self.FACE_DETECT_WIDTH
+        small_h = max(1, int(round(frame.shape[0] * scale)))
+        small = cv2.resize(frame, (small_w, small_h))
+        gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
+        kwargs = {
+            "scaleFactor": self.FACE_SCALE_FACTOR,
+            "minNeighbors": self.FACE_MIN_NEIGHBORS,
+            "minSize": (36, 36),
+        }
+
+        rects = []
+        if not self.face_cascade.empty():
+            rects.extend(self.face_cascade.detectMultiScale(gray, **kwargs))
+        if not self.profile_cascade.empty():
+            rects.extend(self.profile_cascade.detectMultiScale(gray, **kwargs))
+            flipped = cv2.flip(gray, 1)
+            for (fx, fy, fw, fh) in self.profile_cascade.detectMultiScale(flipped, **kwargs):
+                # espelha o x de volta para o sentido original
+                rects.append((small_w - int(fx) - int(fw), int(fy), int(fw), int(fh)))
+
+        boxes = []
+        for (fx, fy, fw, fh) in rects:
+            box = (
+                int(round(fx / scale)),
+                int(round(fy / scale)),
+                int(round(fw / scale)),
+                int(round(fh / scale)),
+            )
+            # descarta duplicatas: o mesmo rosto achado por cascades diferentes
+            if any(self._iou(box, other) > 0.4 for other in boxes):
+                continue
+            boxes.append(box)
+        return boxes
+
+    @staticmethod
+    def _iou(a, b):
+        """Intersecao sobre uniao de duas caixas no formato (x, y, w, h)."""
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        ix1, iy1 = max(ax, bx), max(ay, by)
+        ix2, iy2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        union = aw * ah + bw * bh - inter
+        return inter / union if union > 0 else 0.0
+
+    def _track_faces(self, detected, now):
+        """Mantem um rosto por FACE_MEMORY segundos mesmo quando o detector
+        falha por alguns frames (evita que a exclusao do rosto pisque).
+        """
+        remaining = list(detected)
+        tracked = []
+        for face in self._tracked_faces:
+            match = None
+            for i, box in enumerate(remaining):
+                if self._iou(face["box"], box) > 0.25:
+                    match = i
+                    break
+            if match is not None:
+                box = remaining.pop(match)
+                tracked.append({"box": box, "last_seen": now})
+            elif now - face["last_seen"] < self.FACE_MEMORY:
+                tracked.append(face)
+        for box in remaining:
+            tracked.append({"box": box, "last_seen": now})
+        self._tracked_faces = tracked
+        return [face["box"] for face in tracked]
+
+    def _remove_faces_from_mask(self, mask, faces, roi_x, roi_y):
+        """Apaga da mascara de pele as regioes de rosto (com margem para
+        queixo e pescoco), para o rosto nao virar 'mao'."""
+        for (fx, fy, fw, fh) in faces:
+            pad_side = int(fw * self.FACE_BOX_EXPAND) // 2
+            pad_top = int(fh * self.FACE_BOX_EXPAND) // 2
+            pad_bottom = int(fh * self.FACE_BOX_EXPAND)
+            x1 = max(0, fx - pad_side - roi_x)
+            y1 = max(0, fy - pad_top - roi_y)
+            x2 = min(mask.shape[1], fx + fw + pad_side - roi_x)
+            y2 = min(mask.shape[0], fy + fh + pad_bottom - roi_y)
+            if x2 > x1 and y2 > y1:
+                mask[y1:y2, x1:x2] = 0
+        return mask
+
+    # ------------------------------------------------------------- deteccao da mao
+
+    def _select_hand(self, contours, faces, roi_x, roi_y):
+        """Escolhe o contorno da mao entre os contornos de pele.
+
+        Regras, em ordem:
+        - testa do maior contorno para o menor;
+        - o contorno precisa parecer uma mao (area e proporcao);
+        - nao pode estar colado na regiao do rosto/cabeca: pescoco, ombros,
+          peito e cabelo ficam nessa zona proibida e nao sao maos.
+        """
+        zones = []
+        for (fx, fy, fw, fh) in faces:
+            zones.append((
+                fx - int(fw * self.HEAD_ZONE_SIDE) - roi_x,
+                fy - int(fh * self.HEAD_ZONE_TOP) - roi_y,
+                fx + fw + int(fw * self.HEAD_ZONE_SIDE) - roi_x,
+                fy + fh + int(fh * self.HEAD_ZONE_BOTTOM) - roi_y,
+            ))
+
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+            metrics = self._hand_metrics(contour)
+            if metrics is None:
+                continue
+            bx, by, bw, bh = metrics["bbox"]
+            colada_na_cabeca = any(
+                bx < zx2 and bx + bw > zx1 and by < zy2 and by + bh > zy1
+                for (zx1, zy1, zx2, zy2) in zones
+            )
+            if colada_na_cabeca:
+                continue
+            return contour, metrics
+        return None, None
 
     @staticmethod
     def _skin_mask(frame):
@@ -88,7 +257,7 @@ class GestureDisappear:
     def _hand_metrics(self, contour):
         """Classifica o contorno como mao aberta ou fechada.
 
-        Retorna um dict com as metricas ou None se o contorno for pequeno demais.
+        Retorna um dict com as metricas ou None se o contorno nao parecer uma mao.
         - solidez: area do contorno / area do casco convexo. Punho fechado fica
           proximo de 1.0; mao aberta com dedos afastados fica bem abaixo.
         - vales profundos (convexity defects): espacos entre os dedos. Mao aberta
@@ -101,6 +270,9 @@ class GestureDisappear:
         x, y, w, h = cv2.boundingRect(contour)
         if w <= 0 or h <= 0:
             return None
+        aspect = float(w) / float(h)
+        if aspect < self.HAND_MIN_ASPECT or aspect > self.HAND_MAX_ASPECT:
+            return None  # alongado demais: provavelmente braco, pescoco ou corpo
 
         hull_area = cv2.contourArea(cv2.convexHull(contour))
         solidity = area / hull_area if hull_area > 0 else 1.0
@@ -129,42 +301,42 @@ class GestureDisappear:
         }
 
     def _update_state(self, metrics, now):
-        """Maquina de estados com anti-tremido (debounce).
+        """Maquina de estados com janela deslizante (anti-ruido).
 
-        A mudanca de estado so acontece depois de MIN_CONFIRM_FRAMES frames
-        consecutivos com a mesma classificacao.
+        O estado so muda quando a janela dos ultimos HISTORY_FRAMES frames
+        acumula CONFIRM_VOTES classificacoes apontando para o estado novo.
+        Assim um frame isolado ruidoso nao zera a contagem (o que antes
+        deixava a mudanca de status travada em "confirmando").
         """
         if metrics is None:
             if now - self.last_hand_time > self.NO_HAND_TIMEOUT:
                 self.gesture_state = self.STATE_NO_HAND
+                self._history.clear()
                 self._candidate = None
-                self._candidate_count = 0
+                self._candidate_votes = 0
             return
 
         self.last_hand_time = now
-        target = self.STATE_OPEN if metrics["is_open"] else self.STATE_CLOSED
+        classification = self.STATE_OPEN if metrics["is_open"] else self.STATE_CLOSED
+        self._history.append(classification)
 
-        if target == self.gesture_state:
+        if classification == self.gesture_state:
+            # frame concorda com o estado atual: nada a confirmar agora,
+            # mas os votos anteriores da janela continuam valendo
             self._candidate = None
-            self._candidate_count = 0
+            self._candidate_votes = 0
             return
 
-        if target == self._candidate:
-            self._candidate_count += 1
-        else:
-            self._candidate = target
-            self._candidate_count = 1
-
-        if self._candidate_count < self.MIN_CONFIRM_FRAMES:
+        votes = sum(1 for c in self._history if c == classification)
+        self._candidate = classification
+        self._candidate_votes = votes
+        if votes < self.CONFIRM_VOTES:
             return
 
-        previous, self.gesture_state = self.gesture_state, target
+        self.gesture_state = classification
+        self._history.clear()
         self._candidate = None
-        self._candidate_count = 0
-
-        if previous == self.STATE_OPEN and target == self.STATE_CLOSED:
-            if now - self.last_trigger_time > self.FEEDBACK_DURATION:
-                self.last_trigger_time = now  # abriu e fechou: dispara o "OK"
+        self._candidate_votes = 0
 
     # -------------------------------------------------------------- desenho
 
@@ -205,7 +377,7 @@ class GestureDisappear:
         if self._candidate is not None:
             cv2.putText(
                 frame,
-                f"confirmando: {self.STATE_LABELS[self._candidate]} ({self._candidate_count}/{self.MIN_CONFIRM_FRAMES})",
+                f"confirmando: {self.STATE_LABELS[self._candidate]} ({self._candidate_votes}/{self.CONFIRM_VOTES})",
                 (20, 94),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -214,16 +386,18 @@ class GestureDisappear:
                 cv2.LINE_AA,
             )
 
-    def _draw_feedback(self, frame, now):
-        if 0 <= now - self.last_trigger_time <= self.FEEDBACK_DURATION:
+    def _draw_faces(self, frame, faces):
+        """Caixas magenta com a label ROSTO, para diferenciar da mao."""
+        for (fx, fy, fw, fh) in faces:
+            cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), self.FACE_COLOR, 2)
             cv2.putText(
                 frame,
-                "OK",
-                (frame.shape[1] // 2 - 90, frame.shape[0] // 2),
+                "ROSTO",
+                (fx + 6, fy + 22),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                2.5,
-                (0, 255, 0),
-                4,
+                0.6,
+                self.FACE_COLOR,
+                2,
                 cv2.LINE_AA,
             )
 
@@ -232,24 +406,22 @@ class GestureDisappear:
         now = time.time()
 
         roi_x, roi_y, roi_w, roi_h = self._roi(frame)
+        faces = self._track_faces(self._detect_faces(frame), now)
 
-        # a deteccao usa o frame original, antes de qualquer desenho
+        # a deteccao da mao usa o frame original, antes de qualquer desenho;
+        # as regioes de rosto sao removidas para nao virarem "mao"
         roi = frame[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
         mask = self._skin_mask(roi)
+        if faces:
+            mask = self._remove_faces_from_mask(mask, faces, roi_x, roi_y)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        contour = None
-        metrics = None
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            metrics = self._hand_metrics(largest)
-            if metrics is not None:
-                contour = largest
+        contour, metrics = self._select_hand(contours, faces, roi_x, roi_y)
 
         self._update_state(metrics, now)
 
         # ---- desenhos (veja a legenda no canto inferior esquerdo) ----
         cv2.rectangle(frame, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (0, 0, 255), 2)
+        self._draw_faces(frame, faces)
 
         if contour is not None:
             x, y, w, h = metrics["bbox"]
@@ -262,7 +434,6 @@ class GestureDisappear:
 
         self._draw_status(frame, metrics)
         self._draw_legend(frame)
-        self._draw_feedback(frame, now)
         return frame
 
     def run(self):
