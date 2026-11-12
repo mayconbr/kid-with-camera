@@ -71,6 +71,14 @@ python app.py
 - tire a mão do quadro — o status muda para `MAO NAO DETECTADA`
 - pressione `q` para sair
 
+## Pikachu no ombro
+
+Quando o status confirma `MAO FECHADA`, um Pikachu estilizado aparece no canto inferior direito por alguns segundos (`PIKACHU_SECONDS`). Ele é desenhado só com OpenCV (sem sprites externos) e tem:
+
+- volume 3D: gradiente de luz vindo de cima/esquerda em cada parte (corpo, cabeça, orelhas, bochechas, cauda) e uma sombra suave projetada no vídeo
+- animação: entra com um "pop" (ease-out-back), balança o corpo, mexe as orelhas e a cauda e pisca de tempo em tempo
+- visual do anime: amarelo vivo, orelhas com ponta preta, bochechas vermelhas, sorriso em "w" e cauda de raio
+
 ## Ajustes finos
 
 Os parâmetros ficam no topo da classe `GestureDisappear`, em `app.py`:
@@ -90,6 +98,7 @@ Os parâmetros ficam no topo da classe `GestureDisappear`, em `app.py`:
 | `HEAD_MARGIN_SIDE` / `HEAD_MARGIN_TOP` | `0.25` / `0.35` | zona da cabeça ao redor do rosto (fração do tamanho do rosto). Punhos lisos dentro dessa zona são tratados como corpo |
 | `NECK_DEPTH` | `0.9` | profundidade da zona abaixo do rosto (fração da altura do rosto), cobrindo pescoço. Se o seu punho na altura do peito estiver sendo ignorado, diminua; se o pescoço estiver virando "mão", aumente |
 | `ZONE_BYPASS_DEFECTS` | `3` | vales profundos entre os dedos para aceitar uma mão aberta **dentro** da zona do rosto |
+| `PIKACHU_SECONDS` | `2.6` | segundos que o Pikachu fica na tela depois de confirmar `MAO FECHADA` |
 
 Se o status estiver errado na sua iluminação/pele, observe as métricas no topo da tela e ajuste `DEFECT_MAX_CHORD` / `OPEN_MIN_DEFECTS` conforme os valores que aparecerem (a solidez agora é só informativa).
 
@@ -108,7 +117,7 @@ Se a câmera não abrir, confira a permissão da webcam no macOS e no próprio t
 A pasta `tests/` traz testes automatizados (sem precisar de câmera) que cobrem a classificação, a máquina de estados, a zona do rosto/pescoço, uma verificação visual por pixels e uma regressão com um frame real de webcam:
 
 ```bash
-.venv/bin/python tests/test_gesture.py          # classificacao + maquina de estados + selecao mao vs braco
+.venv/bin/python tests/test_gesture.py          # classificacao + maquina de estados + selecao mao vs braco + Pikachu 3D/animacao
 .venv/bin/python tests/test_face.py             # rosto, zona cabeca/pescoco, bypass da mao aberta
 .venv/bin/python tests/test_regression_real.py  # frame real recuperado de uma captura de tela (punho + braco dobrado)
 .venv/bin/python tests/smoke_visual.py           # verifica por pixels os textos/caixas/legendas desenhados

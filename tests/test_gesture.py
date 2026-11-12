@@ -14,6 +14,9 @@ import numpy as np
 
 from app import GestureDisappear
 
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+os.makedirs(OUT, exist_ok=True)
+
 app = GestureDisappear.__new__(GestureDisappear)  # pula __init__ (sem camera)
 app.gesture_state = app.STATE_NO_HAND
 app.last_hand_time = 0.0
@@ -181,5 +184,85 @@ run_frames(None, 1)
 assert app.gesture_state == app.STATE_CLOSED, "dropout curto nao deveria zerar o estado"
 run_frames(None, 30)
 assert app.gesture_state == app.STATE_NO_HAND, "sem mao por muito tempo deveria zerar"
+
+
+def test_pikachu_overlay():
+    """O overlay precisa lembrar o Pikachu do anime: amarelo de verdade
+    (nao o ciano antigo), orelhas com ponta preta, bochechas vermelhas e
+    cauda de raio atras do corpo."""
+    img = np.zeros((720, 1280, 3), np.uint8)
+    overlay_app = GestureDisappear.__new__(GestureDisappear)
+    sx, sy = 980, 520
+    out = overlay_app._draw_pikachu(img, shoulder=(sx, sy))
+    assert out is not None and np.any(out > 20)
+
+    def yellowish(region):
+        # o gradiente 3D varia o tom, entao vale "amarelado" e nao um BGR exato
+        b = region[..., 0].astype(int)
+        g = region[..., 1].astype(int)
+        r = region[..., 2].astype(int)
+        return int(np.sum((r > 140) & (g > 130) & (b < 140)))
+
+    assert yellowish(out[sy + 30:sy + 150, sx - 60:sx + 60]) > 1500, "corpo deveria ser amarelo"
+    assert yellowish(out) > 8000, "Pikachu deveria ter bastante amarelo"
+    # o amarelo nao pode ser o ciano antigo (255,215,0)
+    diff = np.abs(out.astype(int) - np.array((255, 215, 0), int)).max(axis=2)
+    assert int(np.sum(diff <= 20)) < 50, "amarelo nao pode ser o ciano antigo (255,215,0)"
+
+    # pontas pretas das orelhas, no alto
+    for ex in (sx - 100, sx + 100):
+        tip = out[sy - 245:sy - 195, ex - 18:ex + 18]
+        dark = int(np.sum(np.all(tip.astype(int) < 55, axis=2)))
+        assert dark > 60, f"ponta preta da orelha ausente em x={ex} ({dark} px)"
+
+    # bochechas vermelhas, uma de cada lado
+    for cx in (sx - 84, sx + 84):
+        cheek = out[sy - 50:sy - 2, cx - 15:cx + 15]
+        red = int(np.sum((cheek[..., 2] > 180) & (cheek[..., 1] < 120) & (cheek[..., 0] < 110)))
+        assert red > 150, f"bochecha vermelha ausente em x={cx} ({red} px)"
+
+    # cauda de raio amarela atras do corpo, a direita
+    tail = out[sy - 50:sy + 90, sx + 105:sx + 200]
+    assert yellowish(tail) > 800, "cauda de raio amarela ausente"
+
+    # volume: a luz vem de cima/esquerda, entao o alto da cabeca e mais claro
+    top = out[sy - 110:sy - 90, sx - 30:sx + 30].mean()
+    bottom = out[sy - 30:sy - 10, sx - 30:sx + 30].mean()
+    assert top > bottom + 8, f"cabeca sem gradiente 3D ({top:.0f} vs {bottom:.0f})"
+
+    # previa grande para inspecao visual (tests/out/)
+    big = np.full((1000, 1280, 3), 40, np.uint8)
+    overlay_app._draw_pikachu(big, shoulder=(620, 540), scale=2.0)
+    cv2.imwrite(os.path.join(OUT, "pikachu_preview.png"), big)
+    print("overlay do Pikachu: amarelo, pontas pretas, bochechas, cauda e relevo OK")
+
+
+def test_pikachu_animation():
+    """O Pikachu entra com um pop, se mexe com o tempo e pisca."""
+    anim_app = GestureDisappear.__new__(GestureDisappear)
+
+    def draw(elapsed):
+        img = np.zeros((720, 1280, 3), np.uint8)
+        anim_app._draw_pikachu(img, shoulder=(980, 520), elapsed=elapsed)
+        return img
+
+    def area(img):
+        return int(np.sum(np.any(img > 12, axis=2)))
+
+    full, start, later = draw(0.5), draw(0.03), draw(0.9)
+    assert area(start) < area(full) * 0.5, "pop-in deveria comecar pequeno"
+    assert np.count_nonzero(cv2.absdiff(full, later)) > 400, "quadros deveriam se mover"
+
+    # piscada: os brilhos brancos dos olhos somem
+    def white(img):
+        return int(np.sum(np.all(img > 245, axis=2)))
+
+    assert white(draw(0.95)) > 100, "olhos abertos deveriam ter brilho branco"
+    assert white(draw(1.10)) == 0, "piscada deveria fechar os olhos"
+    print("animacao do Pikachu: pop, movimento e piscada OK")
+
+
+test_pikachu_overlay()
+test_pikachu_animation()
 
 print("\nOK: todos os testes passaram")
