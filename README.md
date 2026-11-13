@@ -75,9 +75,11 @@ python app.py
 
 Quando o status confirma `MAO FECHADA`, um Pikachu estilizado aparece no canto inferior direito por alguns segundos (`PIKACHU_SECONDS`). Ele é desenhado só com OpenCV (sem sprites externos) e tem:
 
-- volume 3D: gradiente de luz vindo de cima/esquerda em cada parte (corpo, cabeça, orelhas, bochechas, cauda) e uma sombra suave projetada no vídeo
-- animação: entra com um "pop" (ease-out-back), balança o corpo, mexe as orelhas e a cauda e pisca de tempo em tempo
+- volume 3D: o Pikachu é uma malha 3D montada no próprio código (elipsoides do corpo/cabeça, troncos de cone das orelhas e prismas da cauda), projetada em perspectiva, com face culling, iluminação por face em bandas (cel shading), contorno escuro e sombra suave projetada no vídeo
+- animação: entra com um "pop" (ease-out-back), balança o corpo, gira levemente em 3D, mexe as orelhas e a cauda e pisca de vez em quando
 - visual do anime: amarelo vivo, orelhas com ponta preta, bochechas vermelhas, sorriso em "w" e cauda de raio
+
+Não é usado nenhum arquivo de imagem/modelo externo: tudo é gerado em `app.py`. A posição padrão fica um pouco mais para a esquerda (78% da largura) para a cauda não encostar na borda da tela.
 
 ## Ajustes finos
 

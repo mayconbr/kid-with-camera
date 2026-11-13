@@ -12,6 +12,93 @@ def _load_cascade(filename):
     return cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, filename))
 
 
+_ELLIPSOID_CACHE = {}
+
+
+def _ellipsoid_mesh(rx, ry, rz, nu=12, nv=9):
+    """Malha de um elipsoide centrado na origem: (verts Nx3, faces Mx3)."""
+    key = (round(rx, 3), round(ry, 3), round(rz, 3), nu, nv)
+    cached = _ELLIPSOID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    u = np.linspace(0.0, 2.0 * np.pi, nu, endpoint=False)
+    v = np.linspace(-0.5 * np.pi, 0.5 * np.pi, nv + 1)
+    cu, su = np.cos(u), np.sin(u)
+    cvv, svv = np.cos(v), np.sin(v)
+    verts = np.empty((nv + 1, nu, 3), np.float64)
+    verts[..., 0] = (rx * cvv)[:, None] * cu[None, :]
+    verts[..., 1] = (ry * svv)[:, None]
+    verts[..., 2] = (rz * cvv)[:, None] * su[None, :]
+    verts = verts.reshape(-1, 3)
+    faces = []
+    for i in range(nv):
+        for j in range(nu):
+            j2 = (j + 1) % nu
+            a = i * nu + j
+            b = i * nu + j2
+            c = (i + 1) * nu + j2
+            d = (i + 1) * nu + j
+            faces.append((a, b, c))
+            faces.append((a, c, d))
+    faces = np.array(faces, np.int32)
+    _ELLIPSOID_CACHE[key] = (verts, faces)
+    return verts, faces
+
+
+def _frustum_mesh(p0, p1, r0, r1, sides=12):
+    """Tronco de cone fechado entre p0 e p1 (malha 3D)."""
+    p0 = np.asarray(p0, float)
+    p1 = np.asarray(p1, float)
+    axis = p1 - p0
+    length = float(np.linalg.norm(axis))
+    if length < 1e-6:
+        return np.zeros((0, 3)), np.zeros((0, 3), np.int32)
+    w = axis / length
+    helper = np.array([0.0, 1.0, 0.0]) if abs(w[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+    e1 = np.cross(w, helper)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(w, e1)
+    ang = np.linspace(0.0, 2.0 * np.pi, sides, endpoint=False)
+    ring = np.cos(ang)[:, None] * e1 + np.sin(ang)[:, None] * e2
+    verts = np.vstack([p0 + r0 * ring, p1 + r1 * ring])
+    faces = []
+    for j in range(sides):
+        j2 = (j + 1) % sides
+        faces.append((j, j2, sides + j2))
+        faces.append((j, sides + j2, sides + j))
+    for j in range(1, sides - 1):
+        faces.append((0, j + 1, j))
+        faces.append((sides, sides + j, sides + j + 1))
+    return verts, np.array(faces, np.int32)
+
+
+def _box_mesh(p0, p1, half_w, half_t):
+    """Prisma (caixa) de p0 a p1, com largura no plano xy e espessura em z."""
+    p0 = np.asarray(p0, float)
+    p1 = np.asarray(p1, float)
+    d = p1 - p0
+    length = float(np.linalg.norm(d))
+    if length < 1e-6:
+        return np.zeros((0, 3)), np.zeros((0, 3), np.int32)
+    d = d / length
+    side = np.array([-d[1], d[0], 0.0])
+    norm = float(np.linalg.norm(side))
+    side = side / norm if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+    zaxis = np.array([0.0, 0.0, 1.0])
+    corners = [(-half_w, -half_t), (half_w, -half_t),
+               (half_w, half_t), (-half_w, half_t)]
+    verts = [p0 + a * side + b * zaxis for a, b in corners]
+    verts += [p1 + a * side + b * zaxis for a, b in corners]
+    verts = np.array(verts, float)
+    faces = []
+    for j in range(4):
+        j2 = (j + 1) % 4
+        faces.append((j, j2, 4 + j2))
+        faces.append((j, 4 + j2, 4 + j))
+    faces += [(0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7)]
+    return verts, np.array(faces, np.int32)
+
+
 class GestureDisappear:
     """Detecta mao aberta/fechada na webcam e mostra o status na tela.
 
@@ -393,25 +480,27 @@ class GestureDisappear:
             cv2.putText(frame, text, (x0 + 40, y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
     def _draw_pikachu(self, frame, shoulder=None, scale=1.0, elapsed=None):
-        """Desenha um Pikachu 3D estilo anime no ombro.
+        """Desenha um Pikachu 3D (malha) no ombro.
 
-        Cada parte recebe um gradiente (luz vinda de cima e da esquerda) e o
-        personagem projeta uma sombra suave no video, dando volume. Quando
+        O personagem e montado com malhas 3D (elipsoides, troncos de cone e
+        prismas), projetado em perspectiva e sombreado por face em bandas
+        (cel shading), com contorno escuro e sombra projetada. Quando
         `elapsed` (segundos desde o aparecimento) e informado, ele entra com
-        um "pop", balanca o corpo, mexe orelhas/cauda e pisca de vez em
-        quando. `elapsed=None` desenha a pose parada (util nos testes).
+        um "pop", balanca, gira levemente, mexe orelhas/cauda e pisca.
+        `elapsed=None` desenha a pose parada (util nos testes).
         """
         if frame is None:
             return None
         h, w = frame.shape[:2]
         if shoulder is None:
-            shoulder = (int(w * 0.82), int(h * 0.72))
+            shoulder = (int(w * 0.78), int(h * 0.72))
         sxp, syp = shoulder
         s = float(scale)
 
-        # ---- animacao: pop de entrada, balanco, orelhas, cauda e piscada ----
+        # ---- animacao ----
         if elapsed is None:
-            pop, bob, ear_sway, tail_sway, blink = 1.0, 0.0, 0.0, 0.0, False
+            pop, bob, ear_sway, tail_sway, yaw = 1.0, 0.0, 0.0, 0.0, 0.0
+            blink = False
         else:
             e = max(0.0, float(elapsed))
             t = min(1.0, e / 0.45)
@@ -419,217 +508,223 @@ class GestureDisappear:
             tm = t - 1.0
             pop = max(0.0, 1.0 + c3 * tm ** 3 + c1 * tm ** 2)  # ease-out-back
             bob = -abs(math.sin(e * 6.2)) * 6.0                # px
-            ear_sway = math.sin(e * 5.0) * 5.0                 # graus
-            tail_sway = math.sin(e * 3.0) * 10.0               # graus
+            ear_sway = math.sin(e * 5.0) * 6.0                 # graus
+            tail_sway = math.sin(e * 3.0) * 12.0               # graus
+            yaw = math.sin(e * 1.6) * 9.0                      # graus (giro 3D)
             blink = (e % 1.15) > 1.06
 
-        # ---- paleta (BGR) e gradientes de cada parte: (claro, escuro) ----
+        # ---- paleta, luz e camera ----
         OUTLINE = (40, 64, 96)
         BLACK = (26, 26, 26)
         WHITE = (255, 255, 255)
-        ROLES = {
-            "yellow": ((126, 242, 255), (8, 138, 186)),
-            "cheek": ((96, 132, 255), (26, 44, 200)),
-            "black": ((58, 58, 58), (12, 12, 12)),
-            "brown": ((96, 158, 218), (30, 76, 132)),
+        BASE = {
+            "yellow": (48, 208, 248),
+            "cheek": (40, 70, 240),
+            "black": BLACK,
+            "brown": (45, 100, 165),
         }
+        BANDS = (0.58, 0.80, 1.00)          # multiplicadores do cel shading
+        LIGHT = np.array([-0.42, -0.60, -0.68], float)
+        LIGHT /= np.linalg.norm(LIGHT)      # luz de cima/esquerda/frente
+        CAM = np.array([0.0, 0.0, -1000.0])  # camera em -z olhando para +z
+        F = 1000.0
+        PIVOT = np.array([0.0, 160.0, 0.0])  # pivo do "pop" (perto dos pes)
 
-        # ---- sprite local onde o Pikachu e montado (1 px = 1 px na tela) ----
-        ppu = s                            # pixels do sprite por unidade do desenho
-        OX, OY = 258.0, 362.0              # deslocamento para manter tudo positivo
-        HP = 1.12                          # folga para o "pop" passar de 1.0
-        WW = int(round((245.0 * HP + OX) * ppu)) + 8
-        HH = int(round((160.0 + 75.0 * HP + OY) * ppu)) + 8
+        ppu = s
+        OX, OY = 300.0, 340.0                # deslocamento no sprite local
+        WW = int(round(560.0 * ppu)) + 8
+        HH = int(round(620.0 * ppu)) + 8
         canvas = np.zeros((HH, WW, 3), np.uint8)
-        mask = np.zeros((HH, WW), np.uint8)  # silhueta (alpha) para a sombra
+        mask = np.zeros((HH, WW), np.uint8)   # silhueta (alpha) para a sombra
 
-        PIVOT_Y = 160.0
+        cy, sy_ = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
 
-        def P(dx, dy):
-            px = dx * pop + OX
-            py = PIVOT_Y + (dy - PIVOT_Y) * pop + OY
-            return (int(round(px * ppu)), int(round(py * ppu)))
+        def rot_z(deg):
+            a = math.radians(deg)
+            ca, sa = math.cos(a), math.sin(a)
+            return np.array([[ca, -sa, 0.0], [sa, ca, 0.0], [0.0, 0.0, 1.0]])
 
-        def L(v):
-            return max(1, int(round(v * ppu * pop)))
+        def to_world(p):
+            """Giro global em y + pop em torno do pivo."""
+            p = np.asarray(p, float)
+            if yaw:
+                x = p[..., 0] * cy + p[..., 2] * sy_
+                z = -p[..., 0] * sy_ + p[..., 2] * cy
+                p = np.stack([x, p[..., 1], z], axis=-1)
+            return PIVOT + (p - PIVOT) * pop
 
-        def A(a):
-            return (max(1, int(round(a[0] * ppu * pop))),
-                    max(1, int(round(a[1] * ppu * pop))))
+        def project(p):
+            p = to_world(p)
+            den = np.maximum(F + p[..., 2], 1.0)
+            u = (p[..., 0] * F / den + OX) * ppu
+            v = (p[..., 1] * F / den + OY) * ppu + bob
+            return u, v
 
-        def rot(point, base, deg):
-            """Gira um ponto (unidades do desenho) em torno de `base`."""
-            ang = math.radians(deg)
-            ca, sa = math.cos(ang), math.sin(ang)
-            x, y = point[0] - base[0], point[1] - base[1]
-            return (base[0] + x * ca - y * sa, base[1] + x * sa + y * ca)
-
-        def apply_local(pm, bb, role, fill):
-            """Pinta o gradiente 3D dentro de `pm` (recorte `bb`) no canvas."""
-            x0, y0, x1, y1 = bb
-            sub = pm > 0
-            region = canvas[y0:y1, x0:x1]
-            if role is not None:
-                hi, lo = ROLES[role]
-                hh, ww = pm.shape
-                ny = (np.arange(hh, dtype=np.float32) - (hh - 1) * 0.5) / max(1.0, (hh - 1) * 0.5)
-                nx = (np.arange(ww, dtype=np.float32) - (ww - 1) * 0.5) / max(1.0, (ww - 1) * 0.5)
-                # luz de cima-esquerda: claro no alto/esquerda, escuro embaixo/direita
-                lit = np.clip(0.56 - 0.30 * nx[None, :] - 0.38 * ny[:, None],
-                              0.0, 1.0) ** 0.85
-                for ch in range(3):
-                    vals = lo[ch] + (hi[ch] - lo[ch]) * lit
-                    region[..., ch][sub] = vals[sub].astype(np.uint8)
-            else:
-                region[sub] = fill
-            mreg = mask[y0:y1, x0:x1]
-            np.maximum(mreg, pm, out=mreg)
-
-        def clip_bb(x0, y0, x1, y1):
-            return (max(0, int(x0)), max(0, int(y0)),
-                    min(WW, int(x1) + 1), min(HH, int(y1) + 1))
-
-        def ellipse_part(center, axes, angle=0, role="yellow", fill=None,
-                         outline=OUTLINE, thickness=4):
-            c, ax = P(*center), A(axes)
-            th = L(thickness) if outline is not None and thickness else 0
-            r = max(ax) + th + 2
-            bb = clip_bb(c[0] - r, c[1] - r, c[0] + r, c[1] + r)
-            if bb[2] <= bb[0] or bb[3] <= bb[1]:
+        def render_part(verts, faces, center=(0.0, 0.0, 0.0), rot=None,
+                        role="yellow", outline=True, pad=0.035, flat=None):
+            """Projeta uma malha convexa, cula faces e pinta as bandas de luz."""
+            v = np.asarray(verts, float)
+            if rot is not None:
+                v = v @ rot.T
+            v = v + np.asarray(center, float)
+            if faces.size == 0:
                 return
-            pm = np.zeros((bb[3] - bb[1], bb[2] - bb[0]), np.uint8)
-            cv2.ellipse(pm, (c[0] - bb[0], c[1] - bb[1]), ax, angle, 0, 360,
-                        255, -1, cv2.LINE_AA)
-            apply_local(pm, bb, role, fill)
-            if th:
-                cv2.ellipse(canvas, c, ax, angle, 0, 360, outline, th, cv2.LINE_AA)
-                cv2.ellipse(mask, c, ax, angle, 0, 360, 255, th, cv2.LINE_AA)
-
-        def poly_part(points, role="yellow", fill=None, outline=OUTLINE,
-                      thickness=4, closed=True):
-            pts = np.array([P(*p) for p in points], np.int32)
-            th = L(thickness) if outline is not None and thickness else 0
-            pad = th + 2
-            bb = clip_bb(pts[:, 0].min() - pad, pts[:, 1].min() - pad,
-                         pts[:, 0].max() + pad, pts[:, 1].max() + pad)
-            if bb[2] <= bb[0] or bb[3] <= bb[1]:
+            u, vv = project(v)
+            pts = np.stack([u, vv], axis=-1)
+            tri3 = v[faces]
+            n = np.cross(tri3[:, 1] - tri3[:, 0], tri3[:, 2] - tri3[:, 0])
+            ln = np.linalg.norm(n, axis=1)
+            good = ln > 1e-6
+            n[good] /= ln[good, None]
+            fc = tri3.mean(axis=1)
+            centroid = v.mean(axis=0)
+            flip = np.sum(n * (fc - centroid), axis=1) < 0
+            n[flip] *= -1.0                          # normais para fora
+            facing = np.sum(n * (CAM - fc), axis=1) > 0
+            use = good & facing
+            if not np.any(use):
                 return
-            pm = np.zeros((bb[3] - bb[1], bb[2] - bb[0]), np.uint8)
-            local = (pts - (bb[0], bb[1])).reshape((-1, 1, 2))
-            cv2.fillPoly(pm, [local], 255, cv2.LINE_AA)
-            apply_local(pm, bb, role, fill)
-            if th:
-                glob = pts.reshape((-1, 1, 2))
-                cv2.polylines(canvas, [glob], closed, outline, th, cv2.LINE_AA)
-                cv2.polylines(mask, [glob], closed, 255, th, cv2.LINE_AA)
-
-        def stroke_part(points, width, role="yellow", outline=OUTLINE, pad=4.5):
-            """Traco grosso (tubo) com gradiente, para a cauda de raio."""
-            pts = np.array([P(*p) for p in points], np.int32)
-            th_out = L(width + 2 * pad) if outline is not None else 0
-            bb = clip_bb(pts[:, 0].min() - max(th_out, L(width)) // 2 - 3,
-                         pts[:, 1].min() - max(th_out, L(width)) // 2 - 3,
-                         pts[:, 0].max() + max(th_out, L(width)) // 2 + 3,
-                         pts[:, 1].max() + max(th_out, L(width)) // 2 + 3)
-            if bb[2] <= bb[0] or bb[3] <= bb[1]:
+            tri2d = pts[faces].astype(np.int32)
+            hull = cv2.convexHull(pts.astype(np.int32))
+            if len(hull) >= 3:
+                hc = hull.reshape(-1, 2).mean(axis=0)
+                grown = ((hull.reshape(-1, 2) - hc) * (1.0 + pad) + hc)
+                grown = grown.astype(np.int32).reshape(-1, 1, 2)
+                if flat is not None:
+                    cv2.fillPoly(canvas, [grown], flat, cv2.LINE_AA)
+                    cv2.fillPoly(mask, [grown], 255, cv2.LINE_AA)
+                    return
+                if outline:
+                    cv2.fillPoly(canvas, [grown], OUTLINE, cv2.LINE_AA)
+                cv2.fillPoly(mask, [grown], 255, cv2.LINE_AA)
+                # fundo com a banda media: evita "costuras" escuras entre triangulos
+                mid_col = tuple(int(ch * BANDS[1]) for ch in BASE[role])
+                cv2.fillPoly(canvas, [hull.reshape(-1, 1, 2)], mid_col, cv2.LINE_AA)
+            if flat is not None:
                 return
-            glob = pts.reshape((-1, 1, 2))
-            if th_out:
-                cv2.polylines(canvas, [glob], False, outline, th_out, cv2.LINE_AA)
-                cv2.polylines(mask, [glob], False, 255, th_out, cv2.LINE_AA)
-            pm = np.zeros((bb[3] - bb[1], bb[2] - bb[0]), np.uint8)
-            local = (pts - (bb[0], bb[1])).reshape((-1, 1, 2))
-            cv2.polylines(pm, [local], False, 255, L(width), cv2.LINE_AA)
-            apply_local(pm, bb, role, fill=None)
+            diff = np.clip(n @ LIGHT, 0.0, 1.0)
+            bands = np.digitize(0.50 + 0.50 * diff, [0.70, 0.87])
+            for k in range(3):
+                sel = use & (bands == k)
+                if not np.any(sel):
+                    continue
+                col = tuple(int(min(255, round(ch * BANDS[k])))
+                            for ch in BASE[role])
+                polys = [p.reshape(-1, 1, 2) for p in tri2d[sel]]
+                cv2.fillPoly(canvas, polys, col, cv2.LINE_AA)
 
-        def dot(center, radius, color):
-            c, r = P(*center), max(1, int(round(radius * ppu * pop)))
-            cv2.circle(canvas, c, r, color, -1, cv2.LINE_AA)
-            cv2.circle(mask, c, r, 255, -1, cv2.LINE_AA)
-
-        def arc(center, axes, start, end, color, thickness):
-            c, ax, th = P(*center), A(axes), L(thickness)
+        def decal(center3, axes, color, start=0, end=360, thickness=-1):
+            """Detalhe 2D (olho fechado, brilho, boca) projetado sobre a malha."""
+            u, vv = project(np.asarray([center3], float))
+            c = (int(round(u[0])), int(round(vv[0])))
+            ax = (max(1, int(round(axes[0] * ppu))),
+                  max(1, int(round(axes[1] * ppu))))
+            th = thickness if thickness < 0 else max(1, int(round(thickness * ppu)))
             cv2.ellipse(canvas, c, ax, 0, start, end, color, th, cv2.LINE_AA)
-            cv2.ellipse(mask, c, ax, 0, start, end, 255, th, cv2.LINE_AA)
 
-        # ---- cauda de raio (atras do corpo), girando em torno da base ----
-        tail_base = (84.0, 100.0)
-        def t(p):
-            return rot(p, tail_base, tail_sway)
+        def decal_line(p0, p1, color, thickness):
+            u0, v0 = project(np.asarray([p0], float))
+            u1, v1 = project(np.asarray([p1], float))
+            cv2.line(canvas, (int(round(u0[0])), int(round(v0[0]))),
+                     (int(round(u1[0])), int(round(v1[0]))), color,
+                     max(1, int(round(thickness * ppu))), cv2.LINE_AA)
 
-        stroke_part([t((84, 100)), t((106, 88))], 30, role="brown")
-        band = [t((104, 86)), t((130, 62)), t((102, 36)), t((146, -6))]
-        stroke_part(band, 21)
-        # ponta larga e achatada caracteristica
-        ux, uy = 0.723, -0.690
-        nx, ny = 0.690, 0.723
-        tip_len, tip_half = 34.0, 36.0
-        bx, by = 146.0, -6.0
-        quad = [
-            t((bx + nx * tip_half, by + ny * tip_half)),
-            t((bx - nx * tip_half, by - ny * tip_half)),
-            t((bx + ux * tip_len - nx * tip_half, by + uy * tip_len - ny * tip_half)),
-            t((bx + ux * tip_len + nx * tip_half, by + uy * tip_len + ny * tip_half)),
-        ]
-        poly_part(quad, thickness=4)
+        # ---- cauda de raio 3D (atras de tudo), girando em torno da base ----
+        tail_base = np.array([84.0, 104.0, -40.0])
+        ang = math.radians(tail_sway)
+        tca, tsa = math.cos(ang), math.sin(ang)
 
-        # ---- pes com tres dedos ----
-        for foot_x in (-54, 54):
-            ellipse_part((foot_x, 156), (58, 32))
-            for toe in (-16, 0, 16):
-                p1, p2 = P(foot_x + toe, 160), P(foot_x + toe - 3, 179)
-                cv2.line(canvas, p1, p2, OUTLINE, L(3), cv2.LINE_AA)
-                cv2.line(mask, p1, p2, 255, L(3), cv2.LINE_AA)
+        def tail_pt(p):
+            d = np.asarray(p, float) - tail_base
+            return tail_base + np.array([d[0] * tca - d[1] * tsa,
+                                         d[0] * tsa + d[1] * tca, d[2]])
+
+        p0 = tail_pt((84, 104, -40))
+        p1 = tail_pt((112, 88, -40))
+        p2 = tail_pt((138, 66, -40))
+        p3 = tail_pt((104, 38, -40))
+        p4 = tail_pt((154, 2, -40))
+        tip = p4 + np.array([0.723, -0.690, 0.0]) * 40.0
+        tail = [(p0, p1, 17.0, "brown"), (p1, p2, 13.0, "yellow"),
+                (p2, p3, 13.0, "yellow"), (p3, p4, 13.0, "yellow"),
+                (p4, tip, 30.0, "yellow")]
+        # contorno continuo: uma silhueta escura por tras de todos os gomos
+        for a_pt, b_pt, hw, _role in tail:
+            vb, fb = _box_mesh(a_pt, b_pt, hw + 3.5, 11.5)
+            render_part(vb, fb, flat=OUTLINE)
+        for a_pt, b_pt, hw, role in tail:
+            vb, fb = _box_mesh(a_pt, b_pt, hw, 8.0)
+            render_part(vb, fb, role=role, outline=False)
+
+        # ---- pes ----
+        v_foot, f_foot = _ellipsoid_mesh(58, 30, 44, 11, 8)
+        for fx in (-52.0, 52.0):
+            render_part(v_foot, f_foot, center=(fx, 158.0, 26.0))
 
         # ---- corpo ----
-        ellipse_part((0, 84), (88, 80))
+        v_body, f_body = _ellipsoid_mesh(88, 82, 74, 15, 11)
+        render_part(v_body, f_body, center=(0.0, 84.0, 0.0))
 
-        # ---- bracos curtos com maos redondas ----
-        ellipse_part((-86, 52), (38, 21), angle=50)
-        ellipse_part((86, 52), (38, 21), angle=-50)
-        ellipse_part((-112, 21), (16, 15))
-        ellipse_part((112, 21), (16, 15))
+        # ---- orelhas (atras da cabeca), com ponta preta e balanco ----
+        for sign in (-1.0, 1.0):
+            base = np.array([sign * 38.0, -128.0, 0.0])
+            tip_pt = np.array([sign * 122.0, -282.0, 8.0])
+            a = math.radians(ear_sway * (-1.0 if sign < 0 else 1.0))
+            ea, eb = math.cos(a), math.sin(a)
+            d = tip_pt - base
+            tip_pt = base + np.array([d[0] * ea - d[1] * eb,
+                                      d[0] * eb + d[1] * ea, d[2]])
+            mid = base + (tip_pt - base) * 0.76
+            vb, fb = _frustum_mesh(base, mid, 28.0, 20.0)
+            render_part(vb, fb, role="yellow")
+            vb, fb = _frustum_mesh(mid, tip_pt, 20.0, 9.0)
+            render_part(vb, fb, role="black")
 
-        # ---- orelhas compridas com ponta preta (atras da cabeca) ----
-        for base, ear, tip, swing in (
-            ((-70, -112), [(-34, -118), (-112, -250), (-80, -108)],
-             [(-82, -200), (-100, -196), (-112, -250)], ear_sway),
-            ((70, -112), [(34, -118), (112, -250), (80, -108)],
-             [(82, -200), (100, -196), (112, -250)], -ear_sway),
-        ):
-            ear = [rot(p, base, swing) for p in ear]
-            tip = [rot(p, base, swing) for p in tip]
-            poly_part(ear, outline=None)
-            poly_part(tip, role="black", outline=None)
-            ear_pts = np.array([P(*p) for p in ear], np.int32).reshape((-1, 1, 2))
-            cv2.polylines(canvas, [ear_pts], True, OUTLINE, L(4), cv2.LINE_AA)
-            cv2.polylines(mask, [ear_pts], True, 255, L(4), cv2.LINE_AA)
         # ---- cabeca grande ----
-        ellipse_part((0, -66), (114, 96))
+        v_head, f_head = _ellipsoid_mesh(114, 96, 92, 18, 13)
+        render_part(v_head, f_head, center=(0.0, -66.0, 0.0))
 
-        # ---- olhos grandes com brilho (fechados na piscada) ----
-        for eye_x in (-42, 42):
+        # ---- bracos e maos ----
+        v_arm, f_arm = _ellipsoid_mesh(38, 21, 21, 11, 8)
+        v_hand, f_hand = _ellipsoid_mesh(17, 17, 17, 10, 8)
+        for sign in (-1.0, 1.0):
+            render_part(v_arm, f_arm, center=(sign * 88.0, 54.0, 12.0),
+                        rot=rot_z(sign * 50.0))
+            render_part(v_hand, f_hand, center=(sign * 115.0, 24.0, 24.0))
+
+        # ---- bochechas vermelhas (sobre a superficie da cabeca) ----
+        v_cheek, f_cheek = _ellipsoid_mesh(22, 22, 11, 10, 7)
+        for cx in (-84.0, 84.0):
+            render_part(v_cheek, f_cheek, center=(cx, -26.0, 55.0),
+                        role="cheek", outline=False)
+
+        # ---- olhos (3D) com brilho, ou arco fechado na piscada ----
+        v_eye, f_eye = _ellipsoid_mesh(20, 25, 9, 10, 7)
+        for eye_x in (-42.0, 42.0):
             if blink:
-                arc((eye_x, -70), (20, 16), 20, 160, BLACK, 4)
+                decal((eye_x, -70.0, 92.0), (20, 16), BLACK, 20, 160, 4)
             else:
-                ellipse_part((eye_x, -76), (20, 25), role="black", outline=None)
-                dot((eye_x - 5, -85), 8, WHITE)
-                dot((eye_x + 7, -66), 3.6, WHITE)
-
-        # ---- bochechas vermelhas ----
-        ellipse_part((-84, -26), (23, 23), role="cheek", outline=None)
-        ellipse_part((84, -26), (23, 23), role="cheek", outline=None)
+                render_part(v_eye, f_eye, center=(eye_x, -76.0, 86.0),
+                            role="black", outline=False)
+                decal((eye_x - 5.0, -85.0, 98.0), (8, 8), WHITE)
+                decal((eye_x + 7.0, -66.0, 96.0), (3.6, 3.6), WHITE)
 
         # ---- nariz minusculo ----
-        poly_part([(-6, -46), (6, -46), (0, -38)], role=None, fill=BLACK,
-                  outline=None, thickness=0)
+        v_nose, f_nose = _ellipsoid_mesh(6, 4, 4, 6, 4)
+        render_part(v_nose, f_nose, center=(0.0, -46.0, 92.0),
+                    role="black", outline=False)
 
-        # ---- sorriso em "w" (dois arcos que se encontram no centro) ----
-        for mouth_x in (-23, 23):
-            arc((mouth_x, -24), (24, 16), 0, 180, BLACK, 4)
+        # ---- sorriso em "w" ----
+        for mouth_x in (-23.0, 23.0):
+            decal((mouth_x, -24.0, 86.0), (24, 16), BLACK, 0, 180, 4)
 
-        # ---- sombra projetada (silhueta desfocada, deslocada p/ baixo/direita) ----
-        # Calculada em resolucao reduzida: a sombra e suave, nao precisa de detalhe.
+        # ---- dedos dos pes ----
+        for fx in (-52.0, 52.0):
+            for toe in (-16.0, 0.0, 16.0):
+                decal_line((fx + toe, 168.0, 66.0),
+                           (fx + toe - 3.0, 186.0, 66.0), OUTLINE, 3)
+
+        # ---- sombra projetada (sombra da silhueta, deslocada para baixo/direita) ----
         q = 4.0
         sqw, sqh = max(1, int(WW / q)), max(1, int(HH / q))
         small_mask = cv2.resize(mask, (sqw, sqh), interpolation=cv2.INTER_AREA)
@@ -639,17 +734,14 @@ class GestureDisappear:
         shadow = cv2.warpAffine(sh, shift, (sqw, sqh), flags=cv2.INTER_LINEAR,
                                 borderValue=0)
 
-        # ---- usa o sprite diretamente (ja esta no tamanho final) ----
-        W2, H2 = WW, HH
-        sprite = canvas
+        # ---- composicao sobre o video ----
         alpha = (mask.astype(np.float32) / 255.0)[..., None]
-        shad = cv2.resize(shadow / 255.0, (W2, H2),
+        shad = cv2.resize(shadow / 255.0, (WW, HH),
                           interpolation=cv2.INTER_LINEAR)[..., None]
-
         x0 = int(round(sxp - OX * s))
-        y0 = int(round(syp + bob - OY * s))
+        y0 = int(round(syp - OY * s))
         fx0, fy0 = max(0, x0), max(0, y0)
-        fx1, fy1 = min(w, x0 + W2), min(h, y0 + H2)
+        fx1, fy1 = min(w, x0 + WW), min(h, y0 + HH)
         if fx1 <= fx0 or fy1 <= fy0:
             return frame
         rx0, ry0 = fx0 - x0, fy0 - y0
@@ -658,8 +750,8 @@ class GestureDisappear:
         roi = frame[fy0:fy1, fx0:fx1].astype(np.float32)
         a = alpha[ry0:ry0 + rh, rx0:rx0 + rw]
         sd = shad[ry0:ry0 + rh, rx0:rx0 + rw]
-        src = sprite[ry0:ry0 + rh, rx0:rx0 + rw].astype(np.float32)
-        roi = roi * (1.0 - 0.42 * sd)          # sombra no video
+        src = canvas[ry0:ry0 + rh, rx0:rx0 + rw].astype(np.float32)
+        roi = roi * (1.0 - 0.42 * sd)          # sombra projetada no video
         roi = roi * (1.0 - a) + src * a        # Pikachu por cima
         frame[fy0:fy1, fx0:fx1] = np.clip(roi, 0, 255).astype(np.uint8)
 
@@ -756,7 +848,7 @@ class GestureDisappear:
         self._draw_legend(frame)
 
         if now < self.pikachu_until:
-            shoulder = (int(frame.shape[1] * 0.82), int(frame.shape[0] * 0.72))
+            shoulder = (int(frame.shape[1] * 0.78), int(frame.shape[0] * 0.72))
             elapsed = self.PIKACHU_SECONDS - (self.pikachu_until - now)
             self._draw_pikachu(frame, shoulder=shoulder, elapsed=elapsed)
 

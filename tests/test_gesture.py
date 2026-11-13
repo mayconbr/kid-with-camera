@@ -190,7 +190,7 @@ def test_pikachu_overlay():
     """O overlay precisa lembrar o Pikachu do anime: amarelo de verdade
     (nao o ciano antigo), orelhas com ponta preta, bochechas vermelhas e
     cauda de raio atras do corpo."""
-    img = np.zeros((720, 1280, 3), np.uint8)
+    img = np.full((720, 1280, 3), 90, np.uint8)  # fundo cinza: preto tem que ser do desenho
     overlay_app = GestureDisappear.__new__(GestureDisappear)
     sx, sy = 980, 520
     out = overlay_app._draw_pikachu(img, shoulder=(sx, sy))
@@ -210,8 +210,8 @@ def test_pikachu_overlay():
     assert int(np.sum(diff <= 20)) < 50, "amarelo nao pode ser o ciano antigo (255,215,0)"
 
     # pontas pretas das orelhas, no alto
-    for ex in (sx - 100, sx + 100):
-        tip = out[sy - 245:sy - 195, ex - 18:ex + 18]
+    for ex in (sx - 108, sx + 108):
+        tip = out[sy - 288:sy - 248, ex - 22:ex + 22]
         dark = int(np.sum(np.all(tip.astype(int) < 55, axis=2)))
         assert dark > 60, f"ponta preta da orelha ausente em x={ex} ({dark} px)"
 
